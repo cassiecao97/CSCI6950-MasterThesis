@@ -85,21 +85,24 @@ class FCNN(nn.Module):
         print(f'exp_svf: {exp_svf}')
         print('\n')
 
-        label = torch.tensor(np.array([v for v in demo_svf.values()]), dtype=float)
-        print(label)
-        print('\n')
+        # label = torch.tensor(np.array([v for v in demo_svf.values()]), dtype=float)
+        # print(label)
+        # print('\n')
+        num_unique_demo_states = len(demo_svf.values())
+        label = np.zeros(shape=(num_unique_demo_states))
+        pred = np.zeros(shape=(num_unique_demo_states))
 
         pred = np.array([])
-        for state in demo_svf.keys():
+        for i, state in enumerate(demo_svf.keys()):
+            label[i] = demo_svf[state]
             if state in exp_svf.keys():
-                pred = np.append(pred, exp_svf[state])
-            else:
-                pred = np.append(pred, TIMESTAMP+1) # instead of 0, to avoid edge cases
+                pred[i] = exp_svf[state]
+
         pred = torch.tensor(pred)
         print(pred)
         print('\n')
 
-        loss = self.loss_fn(pred, label)
+        loss = self.loss_fn(pred, torch.tensor(label))
         loss.requires_grad = True
         print(f'Loss: {loss}')
         print('\n')
@@ -135,7 +138,7 @@ class DeepMaxEntIRL():
         '''
         Change the states [0, 0, None, 0, 0] to a tensor that can be passed through neural network
 
-        Input;
+        Input:
             s       a state
 
         Output:
@@ -190,7 +193,7 @@ class DeepMaxEntIRL():
                 old_Q_value = Q[state.__str__()][action]
                 next_max = np.max(Q[next_state.__str__()])
 
-                new_Q_value = (1. - self.lr) * old_Q_value + self.lr * (reward + GAMMA * next_max - old_Q_value)
+                new_Q_value = (1. - self.lr) * old_Q_value + self.lr * (reward + GAMMA * next_max) # No need for the TD term here: # - old_Q_value)
                 Q[state.__str__()][action] = new_Q_value
 
                 state = next_state
@@ -240,6 +243,53 @@ class DeepMaxEntIRL():
         # {CellStateObject1: 1, CellStateObject2: 1, ...}
         return exp_svf
 
+    def policy_from_q(self, q_function):
+        '''
+        Input:
+        q_function  dictionary[state] = [values for each action]
+
+        Output:
+        policy      dictionary[state] = [softmax probability dist]
+        '''
+        pi = defaultdict(lambda: np.zeros(self.solver.env.num_actions))
+        for state in q_function:
+            qs = q_function[state]
+            softmax = np.log(np.sum(np.exp(qs))) # Approx V(s)
+            for a in range(qs.shape[0]):
+                pi[state][a] = np.exp(qs[a] - softmax) # softmax >= qs[a], and as qs[a]->softmax, exponent->0 and e^0=1.
+        return pi
+
+    def policy_propagation(self, pi, start_state, horizon=10):
+        '''
+        Input:
+        pi          Policy function: dictionary[state] = [probability distribution over actions]
+        horizon     Number of steps to assume an agent can take in the environment
+
+        Output:
+        svf_sum   State visitation frequencies dictionary[state] = expected visitation amount
+        '''
+        
+        svf_sum = defaultdict(lambda: 0)
+        
+        svf_i = defaultdict(lambda: 0)
+        svf_i[start_state] = 1
+        for i in range(horizon):
+            svf_iplus1 = defaultdict(lambda: 0)
+            # svf_i[goal_state] = 0 # TODO: Need to set all terminal states to 0 in svf_i
+            for state in svf_i:
+                for action in self.solver.env.num_actions:
+                    next_states = self.solver.env.next_states_and_prob(state, action)
+                    for prob, next_state in next_states:
+                        svf_iplus1[next_state] += prob * pi[state][action] * svf_i[state] # Pretty sure Algo3 in the paper is written wrong, this is the corrected version
+                svf_sum[state] += svf_i[state]            
+            svf_i = svf_iplus1
+
+        for state in svf_i:
+            svf_sum[state] += svf_i[state]            
+
+
+        return svf_sum
+
     def deep_maxent_irl(self):
         '''
         Maximum Entropy Deep IRL
@@ -258,11 +308,19 @@ class DeepMaxEntIRL():
             print(f'Training NN Iteration {i}')
 
             # compute optimal policy given the current Neural Network
-            pi_hat = self.Q_learning()
+            # Q_learning() isn't returning the policy, it's returning the Q function, but in this case close enough!
+            q_function = self.Q_learning()
+            pi_hat = self.policy_from_q(q_function)
+            start_state = self.solver._get_start_state()
+            exp_svf = self.policy_propagation(pi_hat, start_state)
+
+            # Loss  L_{D} = log(pi) * demo_svf_with_actions
+
+
             print(f'\nOptimal policy given neural network: {pi_hat}\n')
 
             # compute the expected svf of the current optimal policy
-            exp_svf = self.exp_policy_svf(pi_hat)
+            # exp_svf = self.exp_policy_svf(pi_hat)
 
 
             # make demo_svf and exp_svf contain the same states
@@ -289,6 +347,7 @@ class DeepMaxEntIRL():
             # calling train() method of Pytorch model is required for the model parameters to be updated during backpropagation
             self.fcnn.model.train()
             loss = self.fcnn.backward(demo_svf, exp_svf)
+            self.fcnn.model.eval()
 
             if loss < 0.05: break
 
