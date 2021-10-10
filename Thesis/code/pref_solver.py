@@ -11,7 +11,7 @@ from gridworld.envs.gridworld_env import CellState
 PARSER = argparse.ArgumentParser(description="Deep Maxent IRL Parameters")
 PARSER.add_argument('--n_feat', dest='n_feat', action="store", default=2, type=int, help="Number of features in your current environment")
 PARSER.add_argument('--gamma', dest='gamma', action="store", default=0.99, type=float, help="Discount Factor") # gamma
-PARSER.add_argument('--n_iters', dest='n_iters', action="store", default=300, type=int, help="Number of iterations to tune NN") # n_iters
+PARSER.add_argument('--n_iters', dest='n_iters', action="store", default=200, type=int, help="Number of iterations to tune NN") # n_iters
 PARSER.add_argument('--traj_len', dest='traj_len', action="store", default=6, type=int, help="The length of each demonstrated trajectory") # len_traj
 PARSER.add_argument('--lr', dest='learning_rate', action="store", default=0.95, type=float, help="Learning Rate") # learning_rate
 ARGS = PARSER.parse_args()
@@ -22,43 +22,60 @@ TIMESTAMP = ARGS.traj_len
 N_FEAT = ARGS.n_feat
 LR = ARGS.learning_rate
 
-def get_expert_demonstrations(path, start, f_s_dict, feat_arr):
-    trajs_str = []
+# ---------------------------------------------------------------------------------------------------------------------------------#
+# ---------------------------------------------------------------------------------------------------------------------------------#
+
+def get_expert_policy(path, start, f_s_dict, feat_arr, actions):
+    policies = []
     trajs = []
 
     input_file = open(path, 'r')
 
     for line in input_file:
-        traj_str = [start.__str__()]
         traj = [start]
+        pi = dict()
 
         cur_state = copy.deepcopy(start)
+        
+        line = line.split()
+        for i in range(len(line)-1):
+            if line[i+1] == 'P':
+                action = actions[0]
 
-        for s in line.split():
-            if s == 'X':
-                next_state = CellState(start.x, start.y, None, cur_state.feat_count)
-            elif s == 'P':
-                for i, f in enumerate(feat_arr):
-                    if cur_state.feature == f:
-                        break
+                ind = feat_arr.index(cur_state.feature)
 
                 new_feat_count = copy.deepcopy(cur_state.feat_count)
-                new_feat_count[i] = new_feat_count[i] + 1
+                new_feat_count[ind] = new_feat_count[ind] + 1
                 next_state = CellState(cur_state.x, cur_state.y, None, new_feat_count)
+
+            elif line[i+1] == 'X':
+                action = actions[1]
+                next_state = CellState(start.x, start.y, None, cur_state.feat_count)
+
             else:
+                ind = feat_arr.index(line[i+1])
+                action = actions[ind+2]
+
                 # because we use f_s_dict, we must guarantee that one feature only appears once in the entire environment
                 # this is one of the drawbacks of this code example
-                next_state = CellState(f_s_dict[s][0], f_s_dict[s][1], s, cur_state.feat_count)
+                next_state = CellState(f_s_dict[line[i+1]][0], f_s_dict[line[i+1]][1], line[i+1], cur_state.feat_count)
 
-            traj_str.append(next_state.__str__())
+            pi[cur_state.__str__()] = action
             traj.append(next_state)
 
             cur_state = next_state
 
-        trajs_str.append(traj_str)
+        if i == len(line)-2:
+            # If we explore the whole envrionment, then we will always end with P, when feat_count = [1,1], then the corresponding action at this state should be GoBase 
+            pi[cur_state.__str__()] = actions[1]
+
+            next_state = CellState(start.x, start.y, None, cur_state.feat_count)
+            traj.append(next_state)
+
+        policies.append(pi)
         trajs.append(traj)
     
-    return trajs_str, trajs
+    return policies, trajs
 
 # ---------------------------------------------------------------------------------------------------------------------------------#
 # ---------------------------------------------------------------------------------------------------------------------------------#
@@ -81,52 +98,72 @@ if __name__ == '__main__':
     elapsed_time = time.time() - start_time
     # print("\nFinished Computing Policy in %g seconds\n" % elapsed_time)
 
-    # actions = solver._get_action_sequence()
-    # print(actions)
-
     agent_policy = solver._get_policy()
-    # print(f'Optimal Policy Given R: {agent_policy}\n')
+    print(f'Optimal Policy Given R: {agent_policy}\n')
 
     cumulative_reward, num_steps, _ = solver.policy_rollout()
-    # print(f'Optimal Policy Cumulative Reward: {cumulative_reward}\n')
+    print(f'Optimal Policy Cumulative Reward: {cumulative_reward}\n')
 
     # print("--------------------------------------------\n")
 
     ''' 
     Get expert demonstration 
     '''
-    file_path = os.getcwd() + "/expert_demos.txt"
-    expert_demos, trajs = get_expert_demonstrations(file_path, solver._get_start_state(), feat_state_dict, solver._get_feat_arr())
-    print(f'Expert Demonstrations in readable strs: {expert_demos}\n')
-    print(f'Expert Demonstrations in CellState Objects: {trajs}\n')
+    file_path = os.getcwd() + "/Thesis/code/expert_demos.txt"
+    expert_policies, trajs = get_expert_policy(file_path, solver._get_start_state(), feat_state_dict, solver._get_feat_arr(), solver._get_actions())
+    print(f'Expert Policies: {expert_policies}\n')
+    print(f'Expert Trajectories: {trajs}\n')
 
     print("--------------------------------------------\n")
 
     ''' 
     Contruct the initial feat_map with states in demos
     '''
-    feat_map = np.empty((0, len(solver._get_feat_arr())+3), int)
+    feat_n_col = (len(solver._get_feat_arr())+3)*2+len(solver._get_actions())
+    feat_map = np.empty((0, feat_n_col), int)
     
-    # None = 0, feat_arr = ['R', 'B'] then R = 1, B = 2
-    # feat_map = [[1, 1, 0, 0, 0]
-    #             [0, 0, 1, 0, 0]
-    #             [0, 0, 0, 1, 0]
-    #             [1, 1, 0, 1, 0]
-    #             [0, 1, 2, 1, 0]
-    #             [0, 1, 0, 1, 1]]
-    for traj in trajs:
-        for state in traj:
+    #     None = 0, feat_arr = ['R', 'B'] then R = 1, B = 2
+    #     Action is a one-hot vector
+    #     Next state is a vector of 1x5
+    #     feat_map is a matrix of dimension Nx15
+
+    #     feat_map = [[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0]
+    #                 [0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, 0]
+    #                 [0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 1, 0, 1, 0]
+    #                 [1, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 1, 0]
+    #                 [0, 1, 2, 1, 0, 1, 0, 0, 0, 0, 1, 0, 1, 1]
+    #                 [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1, 1]
+    for i, traj in enumerate(trajs):
+        for j in range(len(traj)-1):
+            state = traj[j]
+
             if not state.feature:
-                state_vector = np.concatenate((np.array([state.x, state.y, 0]), state.feat_count), axis=None)
+                cur_state = np.concatenate((np.array([state.x, state.y, 0]), state.feat_count), axis=None)
             else:
-                state_vector = np.concatenate((np.array([state.x, state.y, solver._get_feat_arr().index(state.feature)+1]), state.feat_count), axis=None)
+                cur_state = np.concatenate((np.array([state.x, state.y, solver._get_feat_arr().index(state.feature)+1]), state.feat_count), axis=None)
             
-            feat_map = np.vstack([feat_map, state_vector])
+            action_ind = expert_policies[i][state.__str__()]
+            action_vector = np.zeros(shape=len(solver._get_actions()))
+            action_vector[action_ind] = 1
+
+            if j == 0:
+                prev_state_vector = np.concatenate((cur_state,action_vector), axis=None)
+            else:
+                feat_map = np.vstack([feat_map, np.concatenate((prev_state_vector, cur_state), axis=None)])
+                prev_state_vector = np.concatenate((cur_state, action_vector), axis=None)
+        
+        state = traj[-1]
+        if not state.feature:
+            cur_state = np.concatenate((np.array([state.x, state.y, 0]), state.feat_count), axis=None)
+        else:
+            cur_state = np.concatenate((np.array([state.x, state.y, solver._get_feat_arr().index(state.feature)+1]), state.feat_count), axis=None)
+
+        feat_map = np.vstack([feat_map, np.concatenate((prev_state_vector, cur_state), axis=None)])
 
     '''
     Build Neural Network 
     '''
-    fcnn = FCNN(feat_map.shape[1], 2, [5, 5])
+    fcnn = FCNN(feat_map.shape[1], 2, [20, 10])
 
     # print("--------------------------------------------\n")
 

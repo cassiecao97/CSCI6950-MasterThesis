@@ -7,6 +7,7 @@ from torch._C import dtype
 from torch.nn import *
 from collections import OrderedDict, defaultdict, Counter
 from pref_solver import GAMMA, LR, N_ITERS, TIMESTAMP, N_FEAT
+from gridworld.envs.gridworld_env import CellState
 from gridworld_solver import GridworldSolver
 
 
@@ -65,7 +66,7 @@ class FCNN(nn.Module):
         '''
 
         # input = torch.from_numpy(state_tensor).type(torch.FloatTensor)
-        input = torch.tensor(state_tensor, dtype=torch.float, requires_grad=True)
+        input = torch.tensor(state_tensor, dtype=torch.float)
 
         reward = self.model(input)
 
@@ -80,32 +81,23 @@ class FCNN(nn.Module):
         # print(f'Loss for (b, a): {self.loss_fn(b, a)}')
         # print(f'Loss for (c, a): {self.loss_fn(c, a)}')
 
-        print(f'demo_svf:{demo_svf}')
-        print('\n')
-        print(f'exp_svf: {exp_svf}')
-        print('\n')
-
-        # label = torch.tensor(np.array([v for v in demo_svf.values()]), dtype=float)
-        # print(label)
-        # print('\n')
-        num_unique_demo_states = len(demo_svf.values())
-        label = np.zeros(shape=(num_unique_demo_states))
-        pred = np.zeros(shape=(num_unique_demo_states))
-
+        label = np.array([v for v in demo_svf.values()])
+        states = np.array([v for v in demo_svf.keys()])
+        for state in exp_svf.keys():
+            if state not in demo_svf.keys():
+                label = np.append(label, 0)
+                states = np.append(states, state)
+        label = torch.tensor(label, dtype=float, requires_grad=True)
+        
         pred = np.array([])
-        for i, state in enumerate(demo_svf.keys()):
-            label[i] = demo_svf[state]
+        for state in states:
             if state in exp_svf.keys():
-                pred[i] = exp_svf[state]
+                pred = np.append(pred, exp_svf[state])
+            else:
+                pred = np.append(pred, 0)
+        pred = torch.tensor(pred, requires_grad=True)
 
-        pred = torch.tensor(pred)
-        print(pred)
-        print('\n')
-
-        loss = self.loss_fn(pred, torch.tensor(label))
-        loss.requires_grad = True
-        print(f'Loss: {loss}')
-        print('\n')
+        loss = self.loss_fn(pred, label)
 
         # Zero the gradiants accumulated from the previous steps
         self.optimizer.zero_grad()
@@ -115,6 +107,11 @@ class FCNN(nn.Module):
 
         # Update model parameters
         self.optimizer.step()
+
+        print(f'{label}\n')
+        print(f'{pred}\n')
+        print(f'exp_svf {exp_svf}\n')
+        print(f'Loss: {loss}\n')
 
         return loss
 
@@ -134,26 +131,61 @@ class DeepMaxEntIRL():
         self.lr = LR
         self.solver = GridworldSolver(N_FEAT)
 
-    def state_to_tensor(self, s):
+    def demo_trajs_svf(self):
+        '''
+        Compute state visitation frequencies from expert demonstrations
+
+        Inputs:
+            None
+
+        Outputs:
+            demo_svf     State visitation frequencies of demonstrations
+        '''
+        demo_svf = {}
+        for traj in self.demo_trajs:
+            for state in traj:
+                if state.__str__() in demo_svf.keys():
+                    demo_svf[state.__str__()] += 1
+                else:
+                    demo_svf[state.__str__()] = 1
+
+        # {CellStateObject1 : 1, CellStateObject2: 1, ...}
+        demo_svf = {k : int(v/len(self.demo_trajs)) for k, v in demo_svf.items()}
+
+        return demo_svf
+
+    def get_input_vector(self, s, a, s_prime):
         '''
         Change the states [0, 0, None, 0, 0] to a tensor that can be passed through neural network
 
-        Input:
+        Input;
             s       a state
+            a       action
+            s_prime     next state
 
         Output:
             state_vector    a tensor that could be used as an input to the neural network
         '''
 
         if not s.feature:
-            state_vector = np.concatenate((np.array([s.x, s.y, 0]), s.feat_count), axis=None)
+            s_vector = np.concatenate((np.array([s.x, s.y, 0]), s.feat_count), axis=None)
         else:
-            state_vector = np.concatenate((np.array([s.x, s.y, self.feat_arr.index(s.feature)+1]), s.feat_count), axis=None)
+            s_vector = np.concatenate((np.array([s.x, s.y, self.feat_arr.index(s.feature)+1]), s.feat_count), axis=None)
 
-        if state_vector not in self.feat_map:
-            self.feat_map = np.vstack([self.feat_map, state_vector])
+        action_vector = np.zeros(len(self.solver._get_actions()))
+        action_vector[a] = 1
 
-        return state_vector
+        if not s_prime.feature:
+            s_prime_vector = np.concatenate((np.array([s_prime.x, s_prime.y, 0]), s_prime.feat_count), axis=None)
+        else:
+            s_prime_vector = np.concatenate((np.array([s_prime.x, s_prime.y, self.feat_arr.index(s_prime.feature)+1]), s_prime.feat_count), axis=None)
+
+        input_vector = np.concatenate((s_vector, action_vector, s_prime_vector), axis=None)
+
+        if input_vector not in self.feat_map:
+            self.feat_map = np.vstack([self.feat_map, input_vector])
+
+        return input_vector
 
     def Q_learning(self):
         '''
@@ -187,8 +219,10 @@ class DeepMaxEntIRL():
                     action = np.argmax(Q[state.__str__()])
 
                 # change the CellState Object to a tensor, so we could pass it through the neural network
-                input_tensor = self.state_to_tensor(state)
-                next_state, reward, finished, info = self.solver.env.step(action, [self.fcnn, input_tensor])
+                _, next_state = self.T(state, action)[0]
+                input_vector = self.get_input_vector(state, action, next_state)
+
+                _, reward, finished, _ = self.solver.env.step(action, [self.fcnn, input_vector])
 
                 old_Q_value = Q[state.__str__()][action]
                 next_max = np.max(Q[next_state.__str__()])
@@ -201,48 +235,6 @@ class DeepMaxEntIRL():
 
         return Q
 
-    def demo_trajs_svf(self):
-        '''
-        Compute state visitation frequencies from expert demonstrations
-
-        Inputs:
-            None
-
-        Outputs:
-            demo_svf     State visitation frequencies of demonstrations
-        '''
-        demo_svf = {}
-        for traj in self.demo_trajs:
-            for state in traj:
-                if state.__str__() in demo_svf.keys():
-                    demo_svf[state.__str__()] += 1
-                else:
-                    demo_svf[state.__str__()] = 1
-
-        # {CellStateObject1 : 1, CellStateObject2: 1, ...}
-        demo_svf = {k : int(v/len(self.demo_trajs)) for k, v in demo_svf.items()}
-
-        return demo_svf
-
-    def exp_policy_svf(self, pi_hat):
-        '''
-        Compute state visitation frequencies from policy pi_hat
-
-        Inputs:
-            pi_hat      policy given current reward function R_hat
-
-        Outputs:
-            exp_svf     Expected state visitation frequencies of pi_hat
-        '''
-        # first set the current policy to be our pi_hat, before rolling out the policy
-        self.solver._set_policy(pi_hat)
-
-        # roll out the policy n steps into the future
-        _, _, exp_svf = self.solver.policy_rollout(max_steps=TIMESTAMP)
-
-        # {CellStateObject1: 1, CellStateObject2: 1, ...}
-        return exp_svf
-
     def policy_from_q(self, q_function):
         '''
         Input:
@@ -252,14 +244,18 @@ class DeepMaxEntIRL():
         policy      dictionary[state] = [softmax probability dist]
         '''
         pi = defaultdict(lambda: np.zeros(self.solver.env.num_actions))
+
         for state in q_function:
+
             qs = q_function[state]
             softmax = np.log(np.sum(np.exp(qs))) # Approx V(s)
+
             for a in range(qs.shape[0]):
                 pi[state][a] = np.exp(qs[a] - softmax) # softmax >= qs[a], and as qs[a]->softmax, exponent->0 and e^0=1.
+
         return pi
 
-    def policy_propagation(self, pi, start_state, horizon=10):
+    def policy_propagation(self, pi_hat, start_state, horizon=10):
         '''
         Input:
         pi          Policy function: dictionary[state] = [probability distribution over actions]
@@ -272,23 +268,38 @@ class DeepMaxEntIRL():
         svf_sum = defaultdict(lambda: 0)
         
         svf_i = defaultdict(lambda: 0)
-        svf_i[start_state] = 1
+        svf_i[start_state.__str__()] = 1
+
         for i in range(horizon):
+
             svf_iplus1 = defaultdict(lambda: 0)
             # svf_i[goal_state] = 0 # TODO: Need to set all terminal states to 0 in svf_i
+
             for state in svf_i:
-                for action in self.solver.env.num_actions:
-                    next_states = self.solver.env.next_states_and_prob(state, action)
+
+                # state is CellObject.__str__()
+                # change it back to CellObject
+                coord, feat, count = state.split(',')
+                coord = coord[coord.index('(')+1:coord.index(')')]
+                feat = feat[feat.index(':')+1:]
+                count = count[count.index('[')+1:count.index(']')]
+
+                state_obj = CellState(int(coord.split()[0]), int(coord.split()[1]), feat, np.array([int(c) for c in count.split()]))
+
+                for action in self.solver._get_actions():
+                    next_states = self.T(state_obj, action)
+
                     for prob, next_state in next_states:
-                        svf_iplus1[next_state] += prob * pi[state][action] * svf_i[state] # Pretty sure Algo3 in the paper is written wrong, this is the corrected version
-                svf_sum[state] += svf_i[state]            
+                        svf_iplus1[next_state.__str__()] += prob * pi_hat[state][action] * svf_i[state] # Pretty sure Algo3 in the paper is written wrong, this is the corrected version
+
+                svf_sum[state] += svf_i[state]
+
             svf_i = svf_iplus1
 
         for state in svf_i:
             svf_sum[state] += svf_i[state]            
 
-
-        return svf_sum
+        return {k:v/len(svf_sum.keys()) for k, v in svf_sum.items()} # TODO: double check to see if we should normalize it with the number of states
 
     def deep_maxent_irl(self):
         '''
@@ -302,54 +313,29 @@ class DeepMaxEntIRL():
             R_hat           a NX1 vector that is the final reward function learned from IRL
         '''
 
+        # compute the demontration state visitation frequency
         demo_svf = self.demo_trajs_svf()
 
         for i in range(N_ITERS):
-            print(f'Training NN Iteration {i}')
+            print(f'Training NN Iteration {i}\n')
 
             # compute optimal policy given the current Neural Network
             # Q_learning() isn't returning the policy, it's returning the Q function, but in this case close enough!
             q_function = self.Q_learning()
             pi_hat = self.policy_from_q(q_function)
+            print(f'Optimal policy given neural network: {pi_hat}\n')
+
+            # compute the expected state visitation frequency
             start_state = self.solver._get_start_state()
             exp_svf = self.policy_propagation(pi_hat, start_state)
 
             # Loss  L_{D} = log(pi) * demo_svf_with_actions
-
-
-            print(f'\nOptimal policy given neural network: {pi_hat}\n')
-
-            # compute the expected svf of the current optimal policy
-            # exp_svf = self.exp_policy_svf(pi_hat)
-
-
-            # make demo_svf and exp_svf contain the same states
-            # for state in exp_svf.keys():
-            #     if state not in demo_svf.keys():
-            #         demo_svf[state] = 0
-
-            # ordered_exp_svf = OrderedDict()
-            # for state in demo_svf.keys():
-            #     if state not in exp_svf.keys():
-            #         ordered_exp_svf[state] = 0
-            #     else:
-            #         ordered_exp_svf[state] = exp_svf[state]
-
-            # for k, v in exp_svf.items():
-            #     print(f'State: {k}, svf: {v}')
-            # print('\n')
-            # for k, v in demo_svf.items():
-            #     print(f'State: {k}, svf: {v}')
-            # print('\n')
 
             # perform backpropagation on loss
             # .train() is to put the Pytorch model in training mode
             # calling train() method of Pytorch model is required for the model parameters to be updated during backpropagation
             self.fcnn.model.train()
             loss = self.fcnn.backward(demo_svf, exp_svf)
-            self.fcnn.model.eval()
-
-            if loss < 0.05: break
 
             print("--------------------------------------------\n")
 

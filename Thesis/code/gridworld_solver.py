@@ -187,6 +187,9 @@ class GridworldSolver(object):
 
         return action
     
+    def _get_actions(self):
+        return self.env.actions
+    
     def _get_transition_function(self):
         return self.env.T
 
